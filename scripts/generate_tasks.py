@@ -344,6 +344,673 @@ def get_go_file_skeleton(repo_path: str, commit_hash: str, filepath: str) -> Opt
 
 
 # ---------------------------------------------------------------------------
+# TypeScript/JavaScript language helpers
+# ---------------------------------------------------------------------------
+
+_TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".mjs")
+_TS_EXCLUDED_DIRS = ("node_modules/", "dist/", "build/", ".next/")
+_TS_CONFIG_RE = re.compile(
+    r"(.*\.config\.(js|ts|mjs|cjs|mts)$|jest\.config\..*|vitest\.config\..*"
+    r"|webpack\.config\..*|rollup\.config\..*|babel\.config\..*"
+    r"|tsconfig\..*\.json$|\.eslintrc\..*|\.prettierrc\..*"
+    r"|tailwind\.config\..*|next\.config\..*|vite\.config\..*)",
+    re.IGNORECASE,
+)
+_TS_TEST_RE = re.compile(
+    r"(.*\.test\.(ts|tsx|js|jsx)$|.*\.spec\.(ts|tsx|js|jsx)$"
+    r"|.*/__tests__/.*|.*/test/.*|.*/tests/.*)",
+    re.IGNORECASE,
+)
+
+
+def _is_ts_source_file(filepath: str) -> bool:
+    """Check if a file is a valid TS/JS source file (not test/config/excluded)."""
+    if not any(filepath.endswith(ext) for ext in _TS_EXTENSIONS):
+        return False
+    if any(excluded in filepath for excluded in _TS_EXCLUDED_DIRS):
+        return False
+    basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+    if _TS_CONFIG_RE.match(basename):
+        return False
+    if _TS_TEST_RE.match(filepath):
+        return False
+    return True
+
+
+def _is_ts_test_file(filepath: str) -> bool:
+    """Check if filepath is a TypeScript/JavaScript test file."""
+    if not any(filepath.endswith(ext) for ext in _TS_EXTENSIONS):
+        return False
+    return bool(_TS_TEST_RE.match(filepath))
+
+
+def _ts_code_fence(filepath: str) -> str:
+    """Return the appropriate code fence language tag based on file extension."""
+    if filepath.endswith((".ts", ".mts")):
+        return "typescript"
+    elif filepath.endswith(".tsx"):
+        return "tsx"
+    elif filepath.endswith(".jsx"):
+        return "jsx"
+    return "javascript"
+
+
+def get_typescript_file_list(repo_path: str, commit_hash: str) -> Optional[list[str]]:
+    """Get flat list of all TS/JS source files at a specific commit."""
+    raw = git_run(repo_path, ["ls-tree", "-r", "--name-only", commit_hash], timeout=60)
+    if raw is None:
+        return None
+    return [f for f in raw.strip().split("\n") if _is_ts_source_file(f)]
+
+
+def get_typescript_file_tree(repo_path: str, commit_hash: str) -> Optional[str]:
+    """Get all TS/JS source files grouped by top-level directory."""
+    raw = git_run(repo_path, ["ls-tree", "-r", "--name-only", commit_hash], timeout=60)
+    if raw is None:
+        return None
+    ts_files = [f for f in raw.strip().split("\n") if _is_ts_source_file(f)]
+    if not ts_files:
+        return None
+    tree: dict[str, list[str]] = {}
+    for f in ts_files:
+        parts = f.split("/", 1)
+        if len(parts) == 2:
+            tree.setdefault(parts[0] + "/", []).append(f)
+        else:
+            tree.setdefault(".", []).append(f)
+    out: list[str] = []
+    for dir_name in sorted(tree.keys()):
+        files = sorted(tree[dir_name])
+        out.append(f"{dir_name} ({len(files)} files)")
+        for f in files:
+            out.append(f"  {f}")
+    return "\n".join(out)
+
+
+def get_typescript_file_skeleton(repo_path: str, commit_hash: str, filepath: str) -> Optional[str]:
+    """Extract function/class/interface/type signatures from a TS/JS file using regex."""
+    content = git_run(repo_path, ["show", f"{commit_hash}:{filepath}"], timeout=30)
+    if content is None:
+        return None
+    out: list[str] = []
+    content_lines = content.split("\n")
+    ts_pats = [
+        re.compile(r"^export\s+(?:async\s+)?function\s+\w+"),
+        re.compile(r"^export\s+default\s+(?:async\s+)?function\s+\w*"),
+        re.compile(r"^export\s+(?:default\s+)?(?:abstract\s+)?class\s+\w+"),
+        re.compile(r"^export\s+(?:default\s+)?interface\s+\w+"),
+        re.compile(r"^export\s+type\s+\w+"),
+        re.compile(r"^export\s+const\s+\w+"),
+        re.compile(r"^(?:async\s+)?function\s+\w+"),
+        re.compile(r"^(?:abstract\s+)?class\s+\w+"),
+    ]
+    method_pat = re.compile(
+        r"^\s+(?:public|private|protected|static|async|abstract|readonly|\s)*"
+        r"(?:get\s+|set\s+)?(\w+)\s*(?:<[^>]*>)?\s*\("
+    )
+    in_class = False
+    class_indent = 0
+    for i, line in enumerate(content_lines, 1):
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith("//") or stripped.lstrip().startswith("*") or stripped.lstrip().startswith("/*"):
+            continue
+        matched = False
+        for pat in ts_pats:
+            if pat.match(stripped):
+                sig = stripped.split("{")[0].rstrip()
+                out.append(f"{sig} (line {i})")
+                if "class " in stripped:
+                    in_class = True
+                    class_indent = len(line) - len(line.lstrip())
+                matched = True
+                break
+        if not matched and in_class and stripped.strip():
+            cur_indent = len(line) - len(line.lstrip())
+            if cur_indent <= class_indent and not stripped.strip().startswith("}"):
+                in_class = False
+            elif cur_indent > class_indent:
+                m = method_pat.match(line)
+                if m and m.group(1) not in ("if", "for", "while", "switch", "catch", "return", "new", "throw"):
+                    sig = stripped.split("{")[0].rstrip()
+                    out.append(f"  {sig.strip()} (line {i})")
+    if not out:
+        return None
+    return "\n".join(out)
+
+
+def _match_ts_skeleton_to_changes(skeleton: str, changed_lines: list[int]) -> list[str]:
+    """Match changed lines to TypeScript/JavaScript skeleton entries."""
+    if not skeleton or not changed_lines:
+        return []
+    changed_set = set(changed_lines)
+    matches: list[str] = []
+    skel_entries: list[tuple[str, int]] = []
+    for sline in skeleton.split("\n"):
+        m = re.search(r"\(line (\d+)\)", sline)
+        if m:
+            skel_entries.append((sline[:m.start()].strip(), int(m.group(1))))
+    if not skel_entries:
+        return []
+    skel_entries.sort(key=lambda x: x[1])
+    for idx, (name, start_line) in enumerate(skel_entries):
+        end_line = skel_entries[idx + 1][1] - 1 if idx + 1 < len(skel_entries) else max(changed_lines) + 50
+        if set(range(start_line, end_line + 1)) & changed_set:
+            matches.append(f"{name} (line {start_line})")
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Java language helpers
+# ---------------------------------------------------------------------------
+
+# Directories to exclude for Java projects
+_JAVA_EXCLUDED_DIRS = ("target/", "build/", ".gradle/", ".idea/")
+
+# Config files to exclude for Java projects
+_JAVA_EXCLUDED_FILES = ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle")
+
+# Java test file patterns
+_JAVA_TEST_RE = re.compile(
+    r"(.*Test\.java$|.*Tests\.java$|.*TestCase\.java$|.*IT\.java$)",
+)
+
+
+def _is_java_source_file(filepath: str) -> bool:
+    """Check if a file is a valid Java source file (not test/build/config)."""
+    if not filepath.endswith(".java"):
+        return False
+    if any(excluded in filepath for excluded in _JAVA_EXCLUDED_DIRS):
+        return False
+    # Exclude test files
+    if "/src/test/" in filepath:
+        return False
+    basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+    if basename in _JAVA_EXCLUDED_FILES:
+        return False
+    return True
+
+
+def _is_java_test_file(filepath: str) -> bool:
+    """Check if filepath is a Java test file."""
+    if not filepath.endswith(".java"):
+        return False
+    if "/src/test/" in filepath:
+        return True
+    basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+    return bool(_JAVA_TEST_RE.match(basename))
+
+
+def get_java_file_list(repo_path: str, commit_hash: str) -> Optional[list[str]]:
+    """Get flat list of all Java source files at a specific commit.
+
+    Excludes test files (src/test/), build directories (target/, build/,
+    .gradle/, .idea/), IDE configs, and build config files.
+    """
+    raw = git_run(
+        repo_path,
+        ["ls-tree", "-r", "--name-only", commit_hash],
+        timeout=60,
+    )
+    if raw is None:
+        return None
+
+    java_files = []
+    for f in raw.strip().split("\n"):
+        if not f.endswith(".java"):
+            continue
+        if any(excluded in f for excluded in _JAVA_EXCLUDED_DIRS):
+            continue
+        if "/src/test/" in f:
+            continue
+        basename = f.rsplit("/", 1)[-1] if "/" in f else f
+        if basename in _JAVA_EXCLUDED_FILES:
+            continue
+        java_files.append(f)
+    return java_files
+
+
+def get_java_file_tree(repo_path: str, commit_hash: str) -> Optional[str]:
+    """Get all Java source files at a specific commit, grouped by top-level directory.
+
+    Excludes test files, build directories, and config files.
+    """
+    raw = git_run(
+        repo_path,
+        ["ls-tree", "-r", "--name-only", commit_hash],
+        timeout=60,
+    )
+    if raw is None:
+        return None
+
+    java_files = []
+    for f in raw.strip().split("\n"):
+        if not f.endswith(".java"):
+            continue
+        if any(excluded in f for excluded in _JAVA_EXCLUDED_DIRS):
+            continue
+        if "/src/test/" in f:
+            continue
+        basename = f.rsplit("/", 1)[-1] if "/" in f else f
+        if basename in _JAVA_EXCLUDED_FILES:
+            continue
+        java_files.append(f)
+
+    if not java_files:
+        return None
+
+    # Group by top-level directory for readability
+    tree: dict[str, list[str]] = {}
+    for f in java_files:
+        parts = f.split("/", 1)
+        if len(parts) == 2:
+            top_dir = parts[0] + "/"
+            tree.setdefault(top_dir, []).append(f)
+        else:
+            tree.setdefault(".", []).append(f)
+
+    # Format: show directories with counts, list files under each
+    lines: list[str] = []
+    for dir_name in sorted(tree.keys()):
+        files = sorted(tree[dir_name])
+        lines.append(f"{dir_name} ({len(files)} files)")
+        for f in files:
+            lines.append(f"  {f}")
+
+    return "\n".join(lines)
+
+
+def get_java_file_skeleton(repo_path: str, commit_hash: str, filepath: str) -> Optional[str]:
+    """Extract class/interface/method signatures from a Java file using regex.
+
+    Returns a skeleton representation with:
+    - public class/interface/enum/abstract class declarations
+    - public method signatures
+    - @Override, @Test annotations (included preceding the method)
+
+    Shows signature lines only, no method bodies.
+    """
+    content = git_run(repo_path, ["show", f"{commit_hash}:{filepath}"], timeout=30)
+    if content is None:
+        return None
+
+    lines_out: list[str] = []
+    content_lines = content.split("\n")
+
+    # Patterns for Java signatures
+    class_pattern = re.compile(
+        r"^\s*(?:public\s+)?(?:abstract\s+)?(?:final\s+)?"
+        r"(class|interface|enum)\s+(\w+)"
+    )
+    method_pattern = re.compile(
+        r"^\s*(?:@\w+\s*(?:\([^)]*\))?\s*)*"
+        r"(?:public|protected|private)\s+"
+        r"(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?"
+        r"(?:<[^>]+>\s+)?(?:\w+(?:<[^>]*>)?(?:\[\])*)\s+"
+        r"(\w+)\s*\("
+    )
+    annotation_pattern = re.compile(r"^\s*@(\w+)")
+
+    pending_annotation = None
+    in_class = False
+
+    for i, line in enumerate(content_lines, 1):
+        stripped = line.rstrip()
+
+        # Track annotations
+        ann_match = annotation_pattern.match(stripped)
+        if ann_match:
+            ann_name = ann_match.group(1)
+            if ann_name in ("Override", "Test", "ParameterizedTest",
+                            "BeforeEach", "AfterEach", "BeforeAll", "AfterAll",
+                            "DisplayName"):
+                pending_annotation = stripped.strip()
+            continue
+
+        # Check for class/interface/enum declarations
+        class_match = class_pattern.match(stripped)
+        if class_match:
+            kind = class_match.group(1)
+            name = class_match.group(2)
+            sig_line = stripped.split("{")[0].rstrip()
+            lines_out.append(f"{sig_line} (line {i})")
+            in_class = True
+            pending_annotation = None
+            continue
+
+        # Check for method signatures
+        method_match = method_pattern.match(stripped)
+        if method_match and in_class:
+            sig_line = stripped.split("{")[0].rstrip()
+            # Remove trailing semicolons for interface methods
+            sig_line = sig_line.rstrip(";").rstrip()
+            if pending_annotation:
+                lines_out.append(f"  {pending_annotation}")
+            lines_out.append(f"  {sig_line} (line {i})")
+            pending_annotation = None
+            continue
+
+        # Also detect methods without explicit visibility (package-private) that have annotations
+        if pending_annotation and stripped.strip() and not stripped.strip().startswith("//"):
+            # Check if it looks like a method
+            simple_method = re.match(
+                r"^\s+(?:static\s+)?(?:final\s+)?(?:<[^>]+>\s+)?"
+                r"(?:\w+(?:<[^>]*>)?(?:\[\])*)\s+(\w+)\s*\(",
+                stripped
+            )
+            if simple_method:
+                sig_line = stripped.split("{")[0].rstrip().rstrip(";").rstrip()
+                lines_out.append(f"  {pending_annotation}")
+                lines_out.append(f"  {sig_line} (line {i})")
+            pending_annotation = None
+            continue
+
+        pending_annotation = None
+
+    if not lines_out:
+        return None
+    return "\n".join(lines_out)
+
+
+def _match_java_skeleton_to_changes(skeleton: str, changed_lines: list[int]) -> list[str]:
+    """Match changed lines to Java class/method signatures from skeleton output.
+
+    The skeleton contains lines like:
+        public class Gson (line 42)
+          public String toJson(Object src) (line 55)
+          @Override
+          public int hashCode() (line 100)
+
+    We find which skeleton entries overlap with the changed line range.
+    """
+    if not changed_lines or not skeleton:
+        return []
+
+    changed_set = set(changed_lines)
+    matches: list[str] = []
+
+    # Parse skeleton entries with their line numbers
+    entries: list[tuple[str, int]] = []
+    for line in skeleton.split("\n"):
+        line = line.strip()
+        m = re.search(r"\(line (\d+)\)$", line)
+        if m:
+            line_num = int(m.group(1))
+            sig = line[:m.start()].strip()
+            entries.append((sig, line_num))
+
+    if not entries:
+        return []
+
+    # Sort entries by line number
+    entries.sort(key=lambda x: x[1])
+
+    # For each entry, estimate its span as [entry_line, next_entry_line - 1]
+    for i, (sig, start_line) in enumerate(entries):
+        if i + 1 < len(entries):
+            end_line = entries[i + 1][1] - 1
+        else:
+            end_line = start_line + 50
+
+        entry_lines = set(range(start_line, end_line + 1))
+        if entry_lines & changed_set:
+            matches.append(f"{sig} (line {start_line})")
+
+    return matches
+
+
+
+# ---------------------------------------------------------------------------
+# Rust language helpers
+# ---------------------------------------------------------------------------
+
+# Directories to exclude for Rust projects
+_RUST_EXCLUDED_DIRS = ("target/",)
+
+# Files to exclude for Rust projects
+_RUST_EXCLUDED_FILES = {"Cargo.toml", "Cargo.lock", "build.rs"}
+
+
+def _is_rust_source_file(filepath: str) -> bool:
+    """Check if a file is a valid Rust source file (not test/build/config).
+
+    Excludes:
+    - Files not ending in .rs
+    - Files in target/ directory (build output)
+    - Files in tests/ directory (integration tests)
+    - Cargo.toml, Cargo.lock, build.rs
+
+    Note: Rust unit tests live INSIDE source files (#[cfg(test)] mod tests),
+    so we cannot exclude them at the file level. This is a known architectural
+    limitation that would require hunk-level analysis to fix.
+    """
+    if not filepath.endswith(".rs"):
+        return False
+    basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+    if basename in _RUST_EXCLUDED_FILES:
+        return False
+    if any(excluded in filepath for excluded in _RUST_EXCLUDED_DIRS):
+        return False
+    # Exclude integration test files in tests/ directory
+    if filepath.startswith("tests/") or "/tests/" in filepath:
+        return False
+    return True
+
+
+def _is_rust_test_file(filepath: str) -> bool:
+    """Check if filepath is a Rust test file (integration test).
+
+    Only detects integration tests in tests/ directory.
+    Unit tests in source files (#[cfg(test)] mod tests {}) are NOT detected
+    at the file level -- this is a known limitation.
+    """
+    if not filepath.endswith(".rs"):
+        return False
+    return filepath.startswith("tests/") or "/tests/" in filepath
+
+
+def get_rust_file_list(repo_path: str, commit_hash: str) -> Optional[list[str]]:
+    """Get flat list of all Rust source files at a specific commit.
+
+    Excludes target/ directory, tests/ directory (integration tests),
+    and Cargo.toml/Cargo.lock/build.rs.
+    """
+    raw = git_run(
+        repo_path,
+        ["ls-tree", "-r", "--name-only", commit_hash],
+        timeout=60,
+    )
+    if raw is None:
+        return None
+
+    rust_files = []
+    for f in raw.strip().split("\n"):
+        if _is_rust_source_file(f):
+            rust_files.append(f)
+    return rust_files
+
+
+def get_rust_file_tree(repo_path: str, commit_hash: str) -> Optional[str]:
+    """Get all Rust source files at a specific commit, grouped by top-level directory.
+
+    Excludes target/, tests/, and config files.
+    """
+    raw = git_run(
+        repo_path,
+        ["ls-tree", "-r", "--name-only", commit_hash],
+        timeout=60,
+    )
+    if raw is None:
+        return None
+
+    rust_files = [f for f in raw.strip().split("\n") if _is_rust_source_file(f)]
+    if not rust_files:
+        return None
+
+    # Group by top-level directory for readability
+    tree: dict[str, list[str]] = {}
+    for f in rust_files:
+        parts = f.split("/", 1)
+        if len(parts) == 2:
+            top_dir = parts[0] + "/"
+            tree.setdefault(top_dir, []).append(f)
+        else:
+            tree.setdefault(".", []).append(f)
+
+    # Format: show directories with counts, list files under each
+    lines: list[str] = []
+    for dir_name in sorted(tree.keys()):
+        files = sorted(tree[dir_name])
+        lines.append(f"{dir_name} ({len(files)} files)")
+        for f in files:
+            lines.append(f"  {f}")
+
+    return "\n".join(lines)
+
+
+def get_rust_file_skeleton(repo_path: str, commit_hash: str, filepath: str) -> Optional[str]:
+    """Extract function/struct/enum/trait/impl signatures from a Rust file using regex.
+
+    Returns a skeleton representation with:
+    - pub fn / fn signatures
+    - pub struct / struct declarations
+    - pub enum / enum declarations
+    - pub trait / trait declarations
+    - impl ... for / impl blocks
+    - pub mod / mod declarations
+    - pub async fn / async fn signatures
+
+    Shows signature lines only, no bodies.
+    """
+    content = git_run(repo_path, ["show", f"{commit_hash}:{filepath}"], timeout=30)
+    if content is None:
+        return None
+
+    lines_out: list[str] = []
+    content_lines = content.split("\n")
+
+    # Patterns for Rust signatures
+    fn_pattern = re.compile(
+        r"^(\s*)(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(\w+)"
+    )
+    struct_pattern = re.compile(
+        r"^(\s*)(?:pub(?:\(crate\))?\s+)?struct\s+(\w+)"
+    )
+    enum_pattern = re.compile(
+        r"^(\s*)(?:pub(?:\(crate\))?\s+)?enum\s+(\w+)"
+    )
+    trait_pattern = re.compile(
+        r"^(\s*)(?:pub(?:\(crate\))?\s+)?trait\s+(\w+)"
+    )
+    impl_pattern = re.compile(
+        r"^(\s*)impl(?:<[^>]*>)?\s+(.+?)(?:\s*\{|$)"
+    )
+    mod_pattern = re.compile(
+        r"^(\s*)(?:pub(?:\(crate\))?\s+)?mod\s+(\w+)"
+    )
+
+    for i, line in enumerate(content_lines, 1):
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith("//") or stripped.lstrip().startswith("/*") or stripped.lstrip().startswith("*"):
+            continue
+
+        # Check impl first (before fn, since impl blocks contain fn)
+        impl_match = impl_pattern.match(stripped)
+        if impl_match and not fn_pattern.match(stripped):
+            indent = impl_match.group(1)
+            impl_target = impl_match.group(2).strip()
+            impl_target = impl_target.split("{")[0].strip()
+            if impl_target:
+                prefix = "  " if indent else ""
+                lines_out.append(f"{prefix}impl {impl_target} (line {i})")
+            continue
+
+        # Functions
+        fn_match = fn_pattern.match(stripped)
+        if fn_match:
+            indent = fn_match.group(1)
+            sig_line = stripped.split("{")[0].rstrip()
+            if " where" in sig_line:
+                sig_line = sig_line[:sig_line.index(" where")].rstrip()
+            prefix = "  " if indent else ""
+            lines_out.append(f"{prefix}{sig_line.strip()} (line {i})")
+            continue
+
+        # Structs
+        struct_match = struct_pattern.match(stripped)
+        if struct_match:
+            indent = struct_match.group(1)
+            name = struct_match.group(2)
+            prefix = "  " if indent else ""
+            lines_out.append(f"{prefix}struct {name} (line {i})")
+            continue
+
+        # Enums
+        enum_match = enum_pattern.match(stripped)
+        if enum_match:
+            indent = enum_match.group(1)
+            name = enum_match.group(2)
+            prefix = "  " if indent else ""
+            lines_out.append(f"{prefix}enum {name} (line {i})")
+            continue
+
+        # Traits
+        trait_match = trait_pattern.match(stripped)
+        if trait_match:
+            indent = trait_match.group(1)
+            name = trait_match.group(2)
+            prefix = "  " if indent else ""
+            lines_out.append(f"{prefix}trait {name} (line {i})")
+            continue
+
+        # Modules
+        mod_match = mod_pattern.match(stripped)
+        if mod_match:
+            indent = mod_match.group(1)
+            name = mod_match.group(2)
+            prefix = "  " if indent else ""
+            lines_out.append(f"{prefix}mod {name} (line {i})")
+            continue
+
+    if not lines_out:
+        return None
+    return "\n".join(lines_out)
+
+
+def _match_rust_skeleton_to_changes(skeleton: str, changed_lines: list[int]) -> list[str]:
+    """Match changed lines to Rust function/struct/impl signatures from skeleton output."""
+    if not changed_lines or not skeleton:
+        return []
+
+    changed_set = set(changed_lines)
+    matches: list[str] = []
+
+    entries: list[tuple[str, int]] = []
+    for line in skeleton.split("\n"):
+        line = line.strip()
+        m = re.search(r"\(line (\d+)\)$", line)
+        if m:
+            line_num = int(m.group(1))
+            sig = line[:m.start()].strip()
+            entries.append((sig, line_num))
+
+    if not entries:
+        return []
+
+    entries.sort(key=lambda x: x[1])
+
+    for i, (sig, start_line) in enumerate(entries):
+        if i + 1 < len(entries):
+            end_line = entries[i + 1][1] - 1
+        else:
+            end_line = start_line + 50
+
+        entry_lines = set(range(start_line, end_line + 1))
+        if entry_lines & changed_set:
+            matches.append(f"{sig} (line {start_line})")
+
+    return matches
+
+# ---------------------------------------------------------------------------
 # Diff parsing helpers
 # ---------------------------------------------------------------------------
 
@@ -605,6 +1272,7 @@ def _select_distractor_files_for_skeleton(
     dir_structure: dict[str, list[str]],
     target_dirs: set[str],
     n_distractors: int = 4,
+    file_ext: str = ".py",
 ) -> list[str]:
     """Select plausible distractor files for Step 3 skeleton display.
 
@@ -615,12 +1283,18 @@ def _select_distractor_files_for_skeleton(
     target_set = set(target_paths)
     distractors: list[str] = []
 
+    # For TypeScript, accept any TS/JS extension; otherwise use the specific ext
+    if file_ext == ".ts":
+        ext_check = _TS_EXTENSIONS
+    else:
+        ext_check = (file_ext,)
+
     # Strategy 1: Sibling files (same package directory)
     for tp in target_paths:
         parent_dir = "/".join(tp.split("/")[:-1])
         siblings = [
             f for f in all_files
-            if f.startswith(parent_dir + "/") and f not in target_set and f.endswith(".py")
+            if f.startswith(parent_dir + "/") and f not in target_set and f.endswith(ext_check)
             and f.count("/") == tp.count("/")  # same depth
         ]
         if siblings:
@@ -675,6 +1349,15 @@ def generate_localization(
     if lang == "go":
         all_files = get_go_file_list(repo_path, parent_hash)
         file_ext = ".go"
+    elif lang == "typescript":
+        all_files = get_typescript_file_list(repo_path, parent_hash)
+        file_ext = ".ts"  # primary ext for filtering; actual files may be .tsx/.js/.jsx
+    elif lang == "java":
+        all_files = get_java_file_list(repo_path, parent_hash)
+        file_ext = ".java"
+    elif lang == "rust":
+        all_files = get_rust_file_list(repo_path, parent_hash)
+        file_ext = ".rs"
     else:
         all_files = get_python_file_list(repo_path, parent_hash)
         file_ext = ".py"
@@ -693,6 +1376,21 @@ def generate_localization(
             f["path"] for f in src_files
             if f["path"].endswith(".go") and not f["path"].endswith("_test.go")
             and not f["path"].startswith("vendor/") and "/vendor/" not in f["path"]
+        ]
+    elif lang == "typescript":
+        target_paths = [
+            f["path"] for f in src_files
+            if _is_ts_source_file(f["path"])
+        ]
+    elif lang == "java":
+        target_paths = [
+            f["path"] for f in src_files
+            if _is_java_source_file(f["path"])
+        ]
+    elif lang == "rust":
+        target_paths = [
+            f["path"] for f in src_files
+            if _is_rust_source_file(f["path"])
         ]
     else:
         target_paths = [f["path"] for f in src_files if f["path"].endswith(".py")]
@@ -837,13 +1535,23 @@ def generate_localization(
     distractor_skeleton_files = _select_distractor_files_for_skeleton(
         all_files, target_paths, dir_structure, target_dirs,
         n_distractors=min(4, max(2, len(target_paths) * 2)),
+        file_ext=file_ext,
     )
     skeleton_file_list = list(target_paths) + distractor_skeleton_files
     random.shuffle(skeleton_file_list)
 
     skeleton_parts: list[str] = []
     for sf in skeleton_file_list:
-        skeleton = get_file_skeleton(repo_path, parent_hash, sf)
+        if lang == "go":
+            skeleton = get_go_file_skeleton(repo_path, parent_hash, sf)
+        elif lang == "typescript":
+            skeleton = get_typescript_file_skeleton(repo_path, parent_hash, sf)
+        elif lang == "java":
+            skeleton = get_java_file_skeleton(repo_path, parent_hash, sf)
+        elif lang == "rust":
+            skeleton = get_rust_file_skeleton(repo_path, parent_hash, sf)
+        else:
+            skeleton = get_file_skeleton(repo_path, parent_hash, sf)
         if skeleton:
             skeleton_parts.append(f"  File: {sf}\n{skeleton}")
         else:
@@ -852,9 +1560,28 @@ def generate_localization(
     step3_output_lines = []
     for tp in target_paths:
         changed_lines = _get_changed_lines(commit, tp)
-        skeleton = get_file_skeleton(repo_path, parent_hash, tp)
+        if lang == "go":
+            skeleton = get_go_file_skeleton(repo_path, parent_hash, tp)
+        elif lang == "typescript":
+            skeleton = get_typescript_file_skeleton(repo_path, parent_hash, tp)
+        elif lang == "java":
+            skeleton = get_java_file_skeleton(repo_path, parent_hash, tp)
+        elif lang == "rust":
+            skeleton = get_rust_file_skeleton(repo_path, parent_hash, tp)
+        else:
+            skeleton = get_file_skeleton(repo_path, parent_hash, tp)
         if skeleton and changed_lines:
-            locations = _match_skeleton_to_changes(repo_path, parent_hash, tp, changed_lines)
+            if lang == "go":
+                # For Go, use regex-based matching from skeleton lines
+                locations = _match_go_skeleton_to_changes(skeleton, changed_lines)
+            elif lang == "typescript":
+                locations = _match_ts_skeleton_to_changes(skeleton, changed_lines)
+            elif lang == "java":
+                locations = _match_java_skeleton_to_changes(skeleton, changed_lines)
+            elif lang == "rust":
+                locations = _match_rust_skeleton_to_changes(skeleton, changed_lines)
+            else:
+                locations = _match_skeleton_to_changes(repo_path, parent_hash, tp, changed_lines)
             if locations:
                 for loc in locations:
                     step3_output_lines.append(f"{tp}: {loc}")
@@ -960,6 +1687,54 @@ def _match_skeleton_to_changes(
             node_lines = set(range(node.lineno, node_end + 1))
             if node_lines & changed_set:
                 matches.append(f"{node.name} (line {node.lineno})")
+
+    return matches
+
+
+def _match_go_skeleton_to_changes(skeleton: str, changed_lines: list[int]) -> list[str]:
+    """Match changed lines to Go function/type signatures from skeleton output.
+
+    The skeleton contains lines like:
+        func FuncName(...) (line 42)
+        type StructName struct (line 10)
+        func (r *Receiver) Method(...) (line 55)
+
+    We find which skeleton entries overlap with the changed line range.
+    """
+    if not changed_lines or not skeleton:
+        return []
+
+    changed_set = set(changed_lines)
+    matches: list[str] = []
+
+    # Parse skeleton entries with their line numbers
+    entries: list[tuple[str, int]] = []
+    for line in skeleton.split("\n"):
+        line = line.strip()
+        m = re.search(r"\(line (\d+)\)$", line)
+        if m:
+            line_num = int(m.group(1))
+            # Extract the signature name (everything before " (line N)")
+            sig = line[:m.start()].strip()
+            entries.append((sig, line_num))
+
+    if not entries:
+        return []
+
+    # Sort entries by line number
+    entries.sort(key=lambda x: x[1])
+
+    # For each entry, estimate its span as [entry_line, next_entry_line - 1]
+    for i, (sig, start_line) in enumerate(entries):
+        if i + 1 < len(entries):
+            end_line = entries[i + 1][1] - 1
+        else:
+            # Last entry: assume it spans ~50 lines
+            end_line = start_line + 50
+
+        entry_lines = set(range(start_line, end_line + 1))
+        if entry_lines & changed_set:
+            matches.append(f"{sig} (line {start_line})")
 
     return matches
 
@@ -1113,6 +1888,34 @@ def generate_edit_generation(
     results: list[dict[str, Any]] = []
     src_files = commit.get("src_files", [])
 
+    # Language-specific settings
+    lang = config.language
+    if lang == "go":
+        src_ext = ".go"
+        code_fence_lang = "go"
+        test_patterns = ("_test.go",)
+        skip_patterns = ("vendor/",)
+    elif lang == "typescript":
+        src_ext = None  # handled by _is_ts_source_file
+        code_fence_lang = "typescript"  # default; overridden per-file below
+        test_patterns = ()  # handled by _is_ts_test_file
+        skip_patterns = ()
+    elif lang == "java":
+        src_ext = ".java"
+        code_fence_lang = "java"
+        test_patterns = ()  # handled by _is_java_test_file
+        skip_patterns = ()
+    elif lang == "rust":
+        src_ext = ".rs"
+        code_fence_lang = "rust"
+        test_patterns = ()  # handled by _is_rust_test_file
+        skip_patterns = ("target/",)
+    else:
+        src_ext = ".py"
+        code_fence_lang = "python"
+        test_patterns = ("/tests/", "/test_", "tests/", "test_", "/testing/")
+        skip_patterns = ()
+
     prompt = (
         "You are a software engineer. Given an issue description and a relevant "
         "section of a source file, produce the code edits needed to resolve the issue. "
@@ -1134,16 +1937,40 @@ def generate_edit_generation(
         if not diff_text:
             continue
 
-        # Only Python files for coherent samples
-        if not filepath.endswith(".py"):
+        # Only target language files for coherent samples
+        if lang == "typescript":
+            if not _is_ts_source_file(filepath):
+                continue
+        elif lang == "java":
+            if not _is_java_source_file(filepath):
+                continue
+        elif lang == "rust":
+            if not _is_rust_source_file(filepath):
+                continue
+        elif not filepath.endswith(src_ext):
             continue
 
         # Skip test files - these are better served by test_writing task type
         # and their changes often don't match the issue description
-        if any(t in filepath.lower() for t in (
-            "/tests/", "/test_", "tests/", "test_", "/testing/"
-        )):
-            continue
+        if lang == "go":
+            if filepath.endswith("_test.go"):
+                continue
+            if filepath.startswith("vendor/") or "/vendor/" in filepath:
+                continue
+        elif lang == "typescript":
+            if _is_ts_test_file(filepath):
+                continue
+        elif lang == "java":
+            if _is_java_test_file(filepath):
+                continue
+        elif lang == "rust":
+            if _is_rust_test_file(filepath):
+                continue
+            if filepath.startswith("target/") or "/target/" in filepath:
+                continue
+        else:
+            if any(t in filepath.lower() for t in test_patterns):
+                continue
 
         # Quality gate: require non-trivial edits (>= 3 meaningful changed lines)
         n_changed = _count_changed_lines(diff_text)
@@ -1183,10 +2010,11 @@ def generate_edit_generation(
             continue
 
         # Build clear, structured input
+        fence_lang = _ts_code_fence(filepath) if lang == "typescript" else code_fence_lang
         input_text = (
             f"Issue: {issue_desc}\n\n"
             f"File: {filepath}\n\n"
-            f"```python\n{focused_code}\n```"
+            f"```{fence_lang}\n{focused_code}\n```"
         )
 
         # Convert diff to search/replace format
@@ -1414,7 +2242,26 @@ def _extract_new_test_code(test_patch: str) -> tuple[str, list[str], list[str], 
     for _hunk_ctx, added_lines in hunk_results:
         code_block = "\n".join(added_lines).rstrip()
         # Only include this hunk if it defines a test method or class
-        if "def test_" in code_block or "class Test" in code_block:
+        # Python: def test_*, class Test*
+        # Go: func Test*, func Benchmark*, t.Run(, assert.
+        # TypeScript: describe(, it(, test(, expect(, beforeEach(, afterEach(
+        # Java: @Test, @ParameterizedTest, @BeforeEach, @AfterEach, assertEquals, assertThat, assertTrue, assertThrows, @DisplayName
+        # Rust: #[test], #[tokio::test], #[cfg(test)], fn test_*, assert!, assert_eq!, assert_ne!
+        if ("def test_" in code_block or "class Test" in code_block
+                or "func Test" in code_block or "func Benchmark" in code_block
+                or "t.Run(" in code_block or "assert." in code_block
+                or "describe(" in code_block or "it(" in code_block
+                or "test(" in code_block or "expect(" in code_block
+                or "beforeEach(" in code_block or "afterEach(" in code_block
+                or "@Test" in code_block or "@ParameterizedTest" in code_block
+                or "@BeforeEach" in code_block or "@AfterEach" in code_block
+                or "assertEquals(" in code_block or "assertThat(" in code_block
+                or "assertTrue(" in code_block or "assertThrows(" in code_block
+                or "@DisplayName" in code_block
+                or "#[test]" in code_block or "#[tokio::test]" in code_block
+                or "#[cfg(test)]" in code_block
+                or "assert!" in code_block or "assert_eq!" in code_block
+                or "assert_ne!" in code_block):
             all_parts.append(code_block)
 
     # Deduplicate imports
@@ -1497,108 +2344,379 @@ def generate_test_writing(
     if len(test_code_lines) < 7:
         return None
 
-    # Quality gate: must contain a test method definition AND an assertion
-    has_test_method = "def test_" in test_code or "class Test" in test_code
-    has_assertion = any(
-        keyword in test_code
-        for keyword in ["assert", "self.assert", "with self.assert", "pytest.raises"]
-    )
-    if not has_test_method or not has_assertion:
-        return None
+    # Language-specific quality gates
+    lang = config.language
+
+    if lang == "go":
+        # Go quality gates
+        has_test_method = (
+            "func Test" in test_code or "func Benchmark" in test_code
+            or "t.Run(" in test_code
+        )
+        has_assertion = any(
+            keyword in test_code
+            for keyword in ["assert.", "t.Error", "t.Fatal", "t.Fail", "require."]
+        )
+        if not has_test_method or not has_assertion:
+            return None
+    elif lang == "typescript":
+        # TypeScript/JavaScript quality gates
+        has_test_method = any(
+            keyword in test_code
+            for keyword in ["describe(", "it(", "test(", "beforeEach(", "afterEach("]
+        )
+        has_assertion = any(
+            keyword in test_code
+            for keyword in ["expect(", "assert.", "should.", "toEqual", "toBe", "toHaveBeenCalled", "rejects", "resolves"]
+        )
+        if not has_test_method or not has_assertion:
+            return None
+    elif lang == "java":
+        # Java quality gates
+        has_test_method = any(
+            keyword in test_code
+            for keyword in ["@Test", "@ParameterizedTest", "@BeforeEach", "@AfterEach"]
+        )
+        has_assertion = any(
+            keyword in test_code
+            for keyword in ["assertEquals(", "assertThat(", "assertTrue(", "assertFalse(",
+                            "assertThrows(", "assertNotNull(", "assertNull(",
+                            "verify(", "when("]
+        )
+        if not has_test_method or not has_assertion:
+            return None
+    elif lang == "rust":
+        # Rust quality gates
+        # Detect #[test], #[tokio::test], #[cfg(test)], fn test_*
+        has_test_method = any(
+            keyword in test_code
+            for keyword in ["#[test]", "#[tokio::test]", "#[cfg(test)]", "fn test_"]
+        )
+        has_assertion = any(
+            keyword in test_code
+            for keyword in ["assert!", "assert_eq!", "assert_ne!", "panic!"]
+        )
+        if not has_test_method or not has_assertion:
+            return None
+    else:
+        # Python quality gates
+        has_test_method = "def test_" in test_code or "class Test" in test_code
+        has_assertion = any(
+            keyword in test_code
+            for keyword in ["assert", "self.assert", "with self.assert", "pytest.raises"]
+        )
+        if not has_test_method or not has_assertion:
+            return None
 
     # Quality gate: for modifications, verify the output contains at least one
-    # complete test method (def test_... with assertion in body)
+    # complete test method with assertion in body
     is_new_file = "new file mode" in test_patch
     if not is_new_file:
-        # Check that there's a def test_ followed by an assertion within ~30 lines
-        method_start_indices = [
-            m.start() for m in re.finditer(r"def test_\w+", test_code)
-        ]
-        if not method_start_indices:
-            return None
-        # Verify at least one method has an assertion in its body
-        has_complete_method = False
-        for start_idx in method_start_indices:
-            # Look at the next 2000 chars after method def for an assertion
-            method_body = test_code[start_idx:start_idx + 2000]
-            if "assert" in method_body:
-                has_complete_method = True
-                break
-        if not has_complete_method:
-            return None
-
-        # Quality gate: output must start with a recognized Python construct
-        # (not data fragments like tuples or orphaned expressions)
-        first_nonblank = ""
-        for line in test_code.split("\n"):
-            if line.strip():
-                first_nonblank = line.strip()
-                break
-        valid_starts = ("def ", "async def ", "class ", "@", "import ", "from ", "#")
-        if not any(first_nonblank.startswith(s) for s in valid_starts):
-            # If output starts with data fragments, trim to first method def
-            first_method = test_code.find("def test_")
-            if first_method > 0:
-                # Find the line start before the method def
-                line_start = test_code.rfind("\n", 0, first_method)
-                if line_start >= 0:
-                    test_code = test_code[line_start + 1:].strip()
-                else:
-                    test_code = test_code[first_method:].strip()
-                # Re-verify after trimming
-                if "assert" not in test_code or "def test_" not in test_code:
+        if lang == "go":
+            # Go: look for func Test* followed by assertion
+            method_start_indices = [
+                m.start() for m in re.finditer(r"func (Test|Benchmark)\w+", test_code)
+            ]
+            if not method_start_indices:
+                # Also accept t.Run( as a subtest
+                if "t.Run(" not in test_code:
                     return None
-            else:
+                method_start_indices = [
+                    m.start() for m in re.finditer(r"t\.Run\(", test_code)
+                ]
+            if method_start_indices:
+                has_complete_method = False
+                for start_idx in method_start_indices:
+                    method_body = test_code[start_idx:start_idx + 2000]
+                    if any(kw in method_body for kw in ["assert.", "t.Error", "t.Fatal", "require."]):
+                        has_complete_method = True
+                        break
+                if not has_complete_method:
+                    return None
+        elif lang == "typescript":
+            # TypeScript: look for describe(/it(/test( followed by expect(
+            method_start_indices = [
+                m.start() for m in re.finditer(r"(describe|it|test)\s*\(", test_code)
+            ]
+            if not method_start_indices:
                 return None
+            has_complete_method = False
+            for start_idx in method_start_indices:
+                method_body = test_code[start_idx:start_idx + 2000]
+                if any(kw in method_body for kw in ["expect(", "assert.", "should.", "toEqual", "toBe"]):
+                    has_complete_method = True
+                    break
+            if not has_complete_method:
+                return None
+        elif lang == "java":
+            # Java: look for @Test followed by assertion
+            method_start_indices = [
+                m.start() for m in re.finditer(r"@Test|@ParameterizedTest", test_code)
+            ]
+            if not method_start_indices:
+                return None
+            has_complete_method = False
+            for start_idx in method_start_indices:
+                method_body = test_code[start_idx:start_idx + 2000]
+                if any(kw in method_body for kw in [
+                    "assertEquals(", "assertThat(", "assertTrue(", "assertFalse(",
+                    "assertThrows(", "assertNotNull(", "assertNull(",
+                    "verify(", "when("
+                ]):
+                    has_complete_method = True
+                    break
+            if not has_complete_method:
+                return None
+        elif lang == "rust":
+            # Rust: look for #[test] or fn test_* followed by assert!/assert_eq!/assert_ne!
+            method_start_indices = [
+                m.start() for m in re.finditer(r"#\[test\]|#\[tokio::test\]|fn test_\w+", test_code)
+            ]
+            if not method_start_indices:
+                return None
+            has_complete_method = False
+            for start_idx in method_start_indices:
+                method_body = test_code[start_idx:start_idx + 2000]
+                if any(kw in method_body for kw in ["assert!", "assert_eq!", "assert_ne!", "panic!"]):
+                    has_complete_method = True
+                    break
+            if not has_complete_method:
+                return None
+        else:
+            # Python: Check that there's a def test_ followed by an assertion within ~30 lines
+            method_start_indices = [
+                m.start() for m in re.finditer(r"def test_\w+", test_code)
+            ]
+            if not method_start_indices:
+                return None
+            # Verify at least one method has an assertion in its body
+            has_complete_method = False
+            for start_idx in method_start_indices:
+                # Look at the next 2000 chars after method def for an assertion
+                method_body = test_code[start_idx:start_idx + 2000]
+                if "assert" in method_body:
+                    has_complete_method = True
+                    break
+            if not has_complete_method:
+                return None
+
+        # Quality gate: output must start with a recognized construct
+        # (not data fragments like tuples or orphaned expressions)
+        if lang == "typescript":
+            first_nonblank = ""
+            for line in test_code.split("\n"):
+                if line.strip():
+                    first_nonblank = line.strip()
+                    break
+            valid_starts = ("describe(", "it(", "test(", "import ", "const ", "let ", "var ", "function ", "//", "/*", "beforeEach(", "afterEach(", "beforeAll(", "afterAll(")
+            if not any(first_nonblank.startswith(s) for s in valid_starts):
+                # Try to trim to first describe/it/test block
+                first_block = -1
+                for pattern in ["describe(", "it(", "test("]:
+                    idx = test_code.find(pattern)
+                    if idx >= 0 and (first_block < 0 or idx < first_block):
+                        first_block = idx
+                if first_block > 0:
+                    line_start = test_code.rfind("\n", 0, first_block)
+                    if line_start >= 0:
+                        test_code = test_code[line_start + 1:].strip()
+                    else:
+                        test_code = test_code[first_block:].strip()
+                    if "expect(" not in test_code:
+                        return None
+                else:
+                    return None
+        elif lang == "java":
+            first_nonblank = ""
+            for line in test_code.split("\n"):
+                if line.strip():
+                    first_nonblank = line.strip()
+                    break
+            valid_starts = ("@Test", "@ParameterizedTest", "@BeforeEach", "@AfterEach",
+                            "@BeforeAll", "@AfterAll", "@DisplayName", "@Override",
+                            "public ", "private ", "protected ", "import ", "package ",
+                            "//", "/*", "class ")
+            if not any(first_nonblank.startswith(s) for s in valid_starts):
+                # Try to trim to first @Test annotation
+                first_test = test_code.find("@Test")
+                if first_test > 0:
+                    line_start = test_code.rfind("\n", 0, first_test)
+                    if line_start >= 0:
+                        test_code = test_code[line_start + 1:].strip()
+                    else:
+                        test_code = test_code[first_test:].strip()
+                    if not any(kw in test_code for kw in ["assertEquals(", "assertThat(", "assertTrue("]):
+                        return None
+                else:
+                    return None
+        elif lang not in ("go", "rust"):
+            first_nonblank = ""
+            for line in test_code.split("\n"):
+                if line.strip():
+                    first_nonblank = line.strip()
+                    break
+            valid_starts = ("def ", "async def ", "class ", "@", "import ", "from ", "#")
+            if not any(first_nonblank.startswith(s) for s in valid_starts):
+                # If output starts with data fragments, trim to first method def
+                first_method = test_code.find("def test_")
+                if first_method > 0:
+                    # Find the line start before the method def
+                    line_start = test_code.rfind("\n", 0, first_method)
+                    if line_start >= 0:
+                        test_code = test_code[line_start + 1:].strip()
+                    else:
+                        test_code = test_code[first_method:].strip()
+                    # Re-verify after trimming
+                    if "assert" not in test_code or "def test_" not in test_code:
+                        return None
+                else:
+                    return None
 
     # Cap output length to stay within evaluation limits (reviewer truncates at 2000 chars)
     # Try to cut at a clean method boundary
     if len(test_code) > 1400:
-        # Find the last method start before the cap
-        cutoff = test_code.rfind("\n    def test_", 0, 1400)
-        if cutoff <= 400:
-            cutoff = test_code.rfind("\n\n", 0, 1400)
+        if lang == "go":
+            # Go: cut at func boundary
+            cutoff = test_code.rfind("\nfunc ", 0, 1400)
+            if cutoff <= 400:
+                cutoff = test_code.rfind("\n\n", 0, 1400)
+        elif lang == "typescript":
+            # TypeScript: cut at describe/it/test boundary
+            cutoff = -1
+            for pat in ["\n  it(", "\n  test(", "\n  describe(", "\nit(", "\ntest(", "\ndescribe("]:
+                c = test_code.rfind(pat, 0, 1400)
+                if c > cutoff:
+                    cutoff = c
+            if cutoff <= 400:
+                cutoff = test_code.rfind("\n\n", 0, 1400)
+        elif lang == "java":
+            # Java: cut at @Test annotation boundary
+            cutoff = -1
+            for pat in ["\n    @Test", "\n  @Test", "\n@Test"]:
+                c = test_code.rfind(pat, 0, 1400)
+                if c > cutoff:
+                    cutoff = c
+            if cutoff <= 400:
+                cutoff = test_code.rfind("\n\n", 0, 1400)
+        elif lang == "rust":
+            # Rust: cut at #[test] or fn test_ boundary
+            cutoff = -1
+            for pat in ["\n    #[test]", "\n#[test]", "\n    fn test_", "\nfn test_"]:
+                c = test_code.rfind(pat, 0, 1400)
+                if c > cutoff:
+                    cutoff = c
+            if cutoff <= 400:
+                cutoff = test_code.rfind("\n\n", 0, 1400)
+        else:
+            # Python: cut at method boundary
+            cutoff = test_code.rfind("\n    def test_", 0, 1400)
+            if cutoff <= 400:
+                cutoff = test_code.rfind("\n\n", 0, 1400)
         if cutoff > 400:
             test_code = test_code[:cutoff].rstrip()
         else:
             test_code = test_code[:1400].rstrip()
         # Re-verify the capped code still has assertion
-        if "assert" not in test_code:
-            return None
+        if lang == "go":
+            if not any(kw in test_code for kw in ["assert.", "t.Error", "t.Fatal", "require."]):
+                return None
+        elif lang == "typescript":
+            if not any(kw in test_code for kw in ["expect(", "assert.", "should.", "toEqual", "toBe"]):
+                return None
+        elif lang == "java":
+            if not any(kw in test_code for kw in ["assertEquals(", "assertThat(", "assertTrue(", "assertFalse(",
+                                                    "assertThrows(", "assertNotNull(", "verify("]):
+                return None
+        elif lang == "rust":
+            if not any(kw in test_code for kw in ["assert!", "assert_eq!", "assert_ne!", "panic!"]):
+                return None
+        else:
+            if "assert" not in test_code:
+                return None
 
     # Quality gate: verify the output is syntactically complete
-    # (balanced parentheses/brackets - rejects truncated assertions)
+    # (balanced parentheses/brackets/braces - rejects truncated assertions)
     open_count = test_code.count("(") - test_code.count(")")
     bracket_count = test_code.count("[") - test_code.count("]")
+    brace_count = test_code.count("{") - test_code.count("}")
     if open_count > 0 or bracket_count > 0:
         # Too many unclosed delimiters - output is likely truncated
         return None
+    if lang == "go" and brace_count > 0:
+        return None
+    if lang == "typescript" and brace_count > 0:
+        return None
+    if lang == "java" and brace_count > 0:
+        return None
+    if lang == "rust" and brace_count > 0:
+        return None
 
     # Quality gate: verify all test methods have bodies (not empty stubs)
-    # e.g., "def test_foo(self):\n\n    @" indicates an empty method
-    method_defs = list(re.finditer(r"def test_\w+\([^)]*\):", test_code))
-    for mdef in method_defs:
-        # Check that there's at least one indented line with code after this def
-        after_def = test_code[mdef.end():]
-        # Get lines until next method def or end
-        body_lines = []
-        for bline in after_def.split("\n")[1:]:  # skip the def line itself
-            if bline.strip().startswith("def ") or bline.strip().startswith("@"):
-                if not body_lines:
-                    # Empty method body - reject
-                    return None
-                break
-            if bline.strip():
-                body_lines.append(bline)
-        # If we reached the end without any body lines for this method
-        if not body_lines and mdef != method_defs[-1]:
-            return None
+    if lang == "python":
+        # Python-specific: check def test_ bodies
+        method_defs = list(re.finditer(r"def test_\w+\([^)]*\):", test_code))
+        for mdef in method_defs:
+            # Check that there's at least one indented line with code after this def
+            after_def = test_code[mdef.end():]
+            # Get lines until next method def or end
+            body_lines = []
+            for bline in after_def.split("\n")[1:]:  # skip the def line itself
+                if bline.strip().startswith("def ") or bline.strip().startswith("@"):
+                    if not body_lines:
+                        # Empty method body - reject
+                        return None
+                    break
+                if bline.strip():
+                    body_lines.append(bline)
+            # If we reached the end without any body lines for this method
+            if not body_lines and mdef != method_defs[-1]:
+                return None
 
     # --- Build output with proper structure ---
     # For new files, the test_code already includes everything; for modifications,
     # we need to wrap the test methods with imports and class definition.
 
-    if is_new_file:
+    if lang == "go":
+        # Go: output the test code directly (Go doesn't need class wrappers)
+        if is_new_file:
+            if test_files:
+                output_text = f"// {test_files[0]}\n\n{test_code}"
+            else:
+                output_text = test_code
+        else:
+            output_parts_go: list[str] = []
+            if test_files:
+                output_parts_go.append(f"// {test_files[0]}")
+                output_parts_go.append("")
+            output_parts_go.append(test_code)
+            output_text = "\n".join(output_parts_go)
+    elif lang == "typescript":
+        # TypeScript: output the test code directly (TS tests use describe/it blocks, not classes)
+        output_parts_ts: list[str] = []
+        if test_files:
+            output_parts_ts.append(f"// {test_files[0]}")
+            output_parts_ts.append("")
+        # Add imports if present
+        if test_imports:
+            for imp in test_imports:
+                output_parts_ts.append(imp)
+            output_parts_ts.append("")
+        output_parts_ts.append(test_code)
+        output_text = "\n".join(output_parts_ts)
+    elif lang == "java":
+        # Java: output with file path comment and test code
+        output_parts_java: list[str] = []
+        if test_files:
+            output_parts_java.append(f"// {test_files[0]}")
+            output_parts_java.append("")
+        # Add imports if present
+        if test_imports:
+            for imp in test_imports:
+                output_parts_java.append(imp)
+            output_parts_java.append("")
+        output_parts_java.append(test_code)
+        output_text = "\n".join(output_parts_java)
+    elif is_new_file:
         # New file: test_code already has imports, class, etc.
         if test_files:
             output_text = f"# {test_files[0]}\n\n{test_code}"
@@ -1689,15 +2807,16 @@ def generate_test_writing(
         if len(output_text) > 1950:
             return None
 
-    # Quality gate: attempt to compile the output to reject syntax errors
+    # Quality gate: attempt to compile the output to reject syntax errors (Python only)
     # Strip the file header comment for compilation
-    compile_text = output_text
-    if compile_text.startswith("# "):
-        compile_text = "\n".join(compile_text.split("\n")[1:])
-    try:
-        compile(compile_text, "<test>", "exec")
-    except SyntaxError:
-        return None
+    if lang == "python":
+        compile_text = output_text
+        if compile_text.startswith("# "):
+            compile_text = "\n".join(compile_text.split("\n")[1:])
+        try:
+            compile(compile_text, "<test>", "exec")
+        except SyntaxError:
+            return None
     prompt = (
         "You are a software engineer writing tests for a code change. "
         "Given an issue description and a summary of the fix that was applied, "
@@ -1713,6 +2832,7 @@ def generate_test_writing(
 
     # Include existing test file content from the parent commit (pre-fix version)
     # so the model knows what to SEARCH for when producing edits
+    code_fence = {"go": "go", "typescript": "typescript", "java": "java"}.get(lang, "python")
     if test_files and repo_path and not is_new_file:
         parent_hash = commit.get("parent_hash")
         if parent_hash:
@@ -1724,7 +2844,7 @@ def generate_test_writing(
                 if len(content_lines) > 1500:
                     test_file_content = "\n".join(content_lines[:1500]) + "\n... (truncated)"
                 input_parts.append(
-                    f"\nTest file: {test_file_path}\n```python\n{test_file_content}\n```"
+                    f"\nTest file: {test_file_path}\n```{code_fence}\n{test_file_content}\n```"
                 )
 
     input_text = "\n".join(input_parts)
@@ -2780,14 +3900,32 @@ def generate_bug_detection(
         return []
 
     # Only single-file source diffs for clarity
-    non_test_src_files = [
-        f for f in src_files
-        if f["path"].endswith(".py")
-        and "/tests/" not in f["path"]
-        and not f["path"].startswith("tests/")
-        and "/test_" not in f["path"]
-        and f.get("diff", "")
-    ]
+    lang = config.language
+    if lang == "go":
+        non_test_src_files = [
+            f for f in src_files
+            if f["path"].endswith(".go")
+            and not f["path"].endswith("_test.go")
+            and not f["path"].startswith("vendor/")
+            and "/vendor/" not in f["path"]
+            and f.get("diff", "")
+        ]
+    elif lang == "java":
+        non_test_src_files = [
+            f for f in src_files
+            if f["path"].endswith(".java")
+            and _is_java_source_file(f["path"])
+            and f.get("diff", "")
+        ]
+    else:
+        non_test_src_files = [
+            f for f in src_files
+            if f["path"].endswith(".py")
+            and "/tests/" not in f["path"]
+            and not f["path"].startswith("tests/")
+            and "/test_" not in f["path"]
+            and f.get("diff", "")
+        ]
     if len(non_test_src_files) != 1:
         return []
 
@@ -2878,9 +4016,10 @@ def generate_bug_detection(
     )
 
     # Build input - ONLY the buggy code
+    bug_code_fence = {"go": "go", "typescript": "typescript", "java": "java"}.get(lang, "python")
     input_text = (
         f"File: `{filepath}`\n\n"
-        f"```python\n{buggy_region}\n```"
+        f"```{bug_code_fence}\n{buggy_region}\n```"
     )
 
     # Cap input size
@@ -3115,6 +4254,7 @@ def process_commit(
     max_context_lines: int,
     localization_n_candidates: int = 30,
     localization_include_prob: float = 0.9,
+    language: str = "python",
 ) -> dict[str, list[dict[str, Any]]]:
     """Process a single commit and generate all requested task types.
 
@@ -3130,6 +4270,7 @@ def process_commit(
         max_context_lines=max_context_lines,
         localization_n_candidates=localization_n_candidates,
         localization_include_prob=localization_include_prob,
+        language=language,
     )
 
     try:
@@ -3255,6 +4396,7 @@ def run(config: Config) -> None:
                     config.max_context_lines,
                     config.localization_n_candidates,
                     config.localization_include_prob,
+                    config.language,
                 ): i
                 for i, commit_line in enumerate(commit_lines)
             }
@@ -3355,6 +4497,13 @@ def parse_args() -> Config:
         default=0.9,
         help="Probability of including target file in localization candidates (default: 0.9)",
     )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="python",
+        choices=["python", "go", "typescript", "java", "rust"],
+        help="Target language for task generation (default: python)",
+    )
 
     args = parser.parse_args()
 
@@ -3377,6 +4526,7 @@ def parse_args() -> Config:
         sample=args.sample,
         localization_n_candidates=args.loc_n_candidates,
         localization_include_prob=args.loc_include_prob,
+        language=args.language,
     )
 
 

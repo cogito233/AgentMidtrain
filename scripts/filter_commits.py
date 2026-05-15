@@ -134,14 +134,57 @@ def all_python_files(commit: dict[str, Any]) -> bool:
     return all(f["filepath"].endswith(".py") for f in files)
 
 
-def all_go_files(commit: dict[str, Any]) -> bool:
-    """Check if all changed files are Go source files (excluding tests and vendor).
+def all_java_files(commit: dict[str, Any]) -> bool:
+    """Check if all changed files are Java files, excluding build/IDE artifacts.
+
+    Allows both source and test .java files — the pipeline handles source/test
+    separation downstream. Rejects non-Java files, build output directories,
+    IDE configs, and build config files.
 
     Args:
         commit: Parsed commit dict.
 
     Returns:
-        True if all changed files end with .go, are not _test.go, and not in vendor/.
+        True if all changed files are valid Java source files.
+    """
+    files = commit.get("changed_files", [])
+    if not files:
+        return False
+
+    # Directories to exclude
+    excluded_dirs = ("target/", "build/", ".gradle/", ".idea/")
+    # Config/build files to exclude
+    excluded_files = ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle")
+
+    for f in files:
+        filepath = f["filepath"]
+        basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+
+        # Must be a .java file or excluded config file
+        if not filepath.endswith(".java"):
+            # Also reject common build config files that might appear
+            if basename in excluded_files or filepath.endswith(".properties"):
+                return False
+            return False
+
+        # Check excluded directories
+        if any(excluded in filepath for excluded in excluded_dirs):
+            return False
+
+    return True
+
+
+def all_go_files(commit: dict[str, Any]) -> bool:
+    """Check if all changed files are Go files (source or test), excluding vendor.
+
+    Allows both .go and _test.go files - the pipeline handles source/test
+    separation downstream. Rejects non-Go files and vendor/ directory.
+
+    Args:
+        commit: Parsed commit dict.
+
+    Returns:
+        True if all changed files end with .go and are not in vendor/.
     """
     files = commit.get("changed_files", [])
     if not files:
@@ -149,8 +192,6 @@ def all_go_files(commit: dict[str, Any]) -> bool:
     for f in files:
         filepath = f["filepath"]
         if not filepath.endswith(".go"):
-            return False
-        if filepath.endswith("_test.go"):
             return False
         if filepath.startswith("vendor/") or "/vendor/" in filepath:
             return False
@@ -225,6 +266,53 @@ def all_typescript_files(commit: dict[str, Any]) -> bool:
     return True
 
 
+# Rust excluded file names (not .rs source files but part of the Rust ecosystem)
+RUST_EXCLUDED_FILES = {"Cargo.toml", "Cargo.lock", "build.rs"}
+
+
+def all_rust_files(commit: dict[str, Any]) -> bool:
+    """Check if all changed files are Rust source files.
+
+    Validates that:
+    - All files end with .rs
+    - No files are in target/ directory (build output)
+    - Excludes Cargo.toml, Cargo.lock, build.rs
+
+    Note: Rust unit tests live INSIDE source files (#[cfg(test)] mod tests),
+    so we cannot simply exclude test files by path. For file-level filtering,
+    only files in tests/ directory (integration tests) are considered test files.
+    This is a known architectural limitation that would require hunk-level
+    analysis to fix.
+
+    Args:
+        commit: Parsed commit dict.
+
+    Returns:
+        True if all changed files are valid Rust source files.
+    """
+    files = commit.get("changed_files", [])
+    if not files:
+        return False
+
+    for f in files:
+        filepath = f.get("filepath", f.get("path", ""))
+        basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+
+        # Exclude Cargo.toml, Cargo.lock, build.rs
+        if basename in RUST_EXCLUDED_FILES:
+            return False
+
+        # Must be a .rs file
+        if not filepath.endswith(".rs"):
+            return False
+
+        # Exclude target/ directory (build output)
+        if filepath.startswith("target/") or "/target/" in filepath:
+            return False
+
+    return True
+
+
 def apply_filters(
     commit: dict[str, Any],
     max_src_files: int,
@@ -249,7 +337,7 @@ def apply_filters(
         python_only: All changed files must be .py (legacy, use language instead).
         exclude_docs: Exclude commits with only comment/docstring changes.
         fix_keywords: Only include commits with fix-related keywords.
-        language: Language filter - "python", "go", "typescript", or "all".
+        language: Language filter - "python", "go", "typescript", "java", "rust", or "all".
 
     Returns:
         True if the commit passes all filters.
@@ -290,6 +378,12 @@ def apply_filters(
     elif language == "typescript":
         if not all_typescript_files(commit):
             return False
+    elif language == "java":
+        if not all_java_files(commit):
+            return False
+    elif language == "rust":
+        if not all_rust_files(commit):
+            return False
     # language == "all" -> no language-specific filter
 
     # Filter: exclude docs-only changes
@@ -312,8 +406,17 @@ def main():
     )
     parser.add_argument(
         "input_file",
+        nargs="?",
         type=str,
+        default=None,
         help="Input JSONL file (output of parse_commits.py).",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        dest="input_flag",
+        help="Input JSONL file (alternative to positional argument).",
     )
     parser.add_argument(
         "-o",
@@ -354,8 +457,8 @@ def main():
         "--language",
         type=str,
         default="python",
-        choices=["python", "go", "all"],
-        help="Language filter: 'python', 'go', or 'all' (default: python).",
+        choices=["python", "go", "typescript", "java", "rust", "all"],
+        help="Language filter: 'python', 'go', 'typescript', 'java', 'rust', or 'all' (default: python).",
     )
     parser.add_argument(
         "--python-only",
@@ -389,7 +492,12 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    input_path = os.path.abspath(args.input_file)
+    # Resolve input file (positional or --input flag)
+    input_file = args.input_file or args.input_flag
+    if input_file is None:
+        parser.error("Input file is required (positional or --input)")
+
+    input_path = os.path.abspath(input_file)
     if not os.path.isfile(input_path):
         logger.error(f"Input file not found: {input_path}")
         sys.exit(1)

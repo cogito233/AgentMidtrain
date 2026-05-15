@@ -58,7 +58,15 @@ def is_test_file(filepath: str) -> bool:
         "/testcase",
         "/spec/",
         "_spec.",
+        "_test.go",  # Go test files
+        "/src/test/",  # Java/Maven test source root
     ]
+    # Java test file name patterns
+    if path_lower.endswith(".java"):
+        java_test_suffixes = ("test.java", "tests.java", "testcase.java", "it.java")
+        basename_lower = path_lower.rsplit("/", 1)[-1] if "/" in path_lower else path_lower
+        if any(basename_lower.endswith(s) for s in java_test_suffixes):
+            return True
     return any(p in path_lower for p in patterns)
 
 
@@ -301,14 +309,28 @@ def main():
     )
     parser.add_argument(
         "repo_dir",
+        nargs="?",
         type=str,
+        default=None,
         help="Path to the git repository to parse.",
+    )
+    parser.add_argument(
+        "--repo-path",
+        type=str,
+        default=None,
+        help="Path to the git repository (alternative to positional argument).",
     )
     parser.add_argument(
         "--output-file",
         type=str,
         default=None,
         help="Output JSONL file path. If set, writes a single JSONL file.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output JSONL file path (alias for --output-file).",
     )
     parser.add_argument(
         "--output-dir",
@@ -321,6 +343,12 @@ def main():
         type=int,
         default=None,
         help="Only process the N most recent commits (for testing).",
+    )
+    parser.add_argument(
+        "--max-commits",
+        type=int,
+        default=None,
+        help="Only process the N most recent commits (alias for --sample).",
     )
     parser.add_argument(
         "--workers",
@@ -339,7 +367,20 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    repo_dir = os.path.abspath(args.repo_dir)
+    # Resolve repo path (positional or --repo-path flag)
+    repo_dir_raw = args.repo_dir or args.repo_path
+    if repo_dir_raw is None:
+        parser.error("Repository path is required (positional or --repo-path)")
+
+    # Resolve output-file alias
+    if args.output_file is None and args.output is not None:
+        args.output_file = args.output
+
+    # Resolve --max-commits alias for --sample
+    if args.sample is None and args.max_commits is not None:
+        args.sample = args.max_commits
+
+    repo_dir = os.path.abspath(repo_dir_raw)
     if not (os.path.isdir(os.path.join(repo_dir, ".git")) or os.path.isfile(os.path.join(repo_dir, "HEAD"))):
         logger.error(f"Not a git repository: {repo_dir}")
         sys.exit(1)
